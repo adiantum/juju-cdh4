@@ -3,7 +3,7 @@ juju-cdh4
 
 Juju charm for Cloudera hadoop distribution CDH4 based on https://jujucharms.com/charms/precise/hadoop.
 
-## Separate HDFS and MapReduce deployment:
+# Separate HDFS and MapReduce deployment:
 
 ```shell
 juju deploy local:cdh4 hdfs-namenode 
