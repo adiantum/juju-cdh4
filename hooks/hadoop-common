@@ -1,0 +1,562 @@
+#!/bin/bash
+#===============================================================================
+#      AUTHOR: Alen Komljen
+#===============================================================================
+set -e
+
+configure_hosts () {
+    private_address=`unit-get private-address`
+    hostname=`hostname`
+    grep -q "^127.0.0.1.*$hostname" /etc/hosts &&
+    sed -i -e "s/^\(127.0.0.1 .*\)$hostname/\1/" /etc/hosts &&
+    echo "$private_address $hostname" >> /etc/hosts
+    hostname=`hostname -f`
+    sed -i -e "s/^127.0.1.1\(.*$hostname.*\)/$private_address\1/" /etc/hosts
+}
+
+# Helpers to support conditional restarts based
+# on specific files changing
+checksum_snapshot () {
+    filename=$1
+    md5sum=$filename.md5
+    md5sum $filename > $filename.md5
+}
+
+file_changed () {
+    filename=$1
+    md5sum=$filename.md5
+    if [ -f $md5sum ]
+    then
+        md5sum -c $md5sum >/dev/null && return 1 || return 0
+    else
+        checksum_snapshot $filename
+    return 1
+    fi
+}
+
+configure_sources () {
+    source=`config-get source`
+    juju-log "Configuring hadoop using Cloudera repo..."
+    wget -q                                                                    \
+    https://archive.cloudera.com/cdh4/ubuntu/precise/amd64/cdh/cloudera.list   \
+    -P /etc/apt/sources.list.d
+    wget -O -                                                                  \
+    https://archive.cloudera.com/cdh4/ubuntu/precise/amd64/cdh/archive.key     \
+    | apt-key add -
+    apt-get update
+}
+
+install_base_packages () {
+    juju-log "Installing base packages..."
+    apt-get install -y hadoop dotdee openjdk-6-jdk
+    echo "JAVA_HOME=/usr/lib/jvm/java-6-openjdk-amd64" >> /etc/environment
+    source /etc/environment
+}
+
+install_optional_packages () {
+    juju-log "Installing optional packages..."
+    pig=`config-get pig`
+    [ "$pig" = "True" ] && apt-get install -y pig || :
+}
+
+config_element () {
+    key=$1
+    value=$2
+    echo " <property>"
+    echo " <name>$1</name>"
+    echo " <value>$2</value>"
+    echo " </property>"
+}
+
+config_basic () {
+    echo "<?xml version=\"1.0\"?>" > $1/01-header
+    echo "<configuration>" > $1/02-header
+    echo "</configuration>" > $1/99-footer
+}
+
+open_ports () {
+    case $hdfs_role in
+    namenode)
+        open-port 8020
+        open-port 50070
+    ;;
+    datanode)
+        open-port 50010
+        open-port 50020
+        open-port 50075
+    ;;
+    secondarynamenode)
+        open-port 50090
+    ;;
+    esac
+    case $mapred_role in
+    jobtracker)
+        open-port 8021
+        open-port 50030
+    ;;
+    tasktracker)
+        open-port 50060
+    ;;
+    esac
+}
+
+MAPRED_CONFIG="mapred.reduce.parallel.copies
+mapred.child.java.opts
+io.sort.factor
+io.sort.mb
+mapred.job.tracker.handler.count
+tasktracker.http.threads
+"
+
+CONFIG_FILES="/etc/hadoop/conf.juju/hdfs-site.xml
+/etc/hadoop/conf.juju/core-site.xml
+/etc/hadoop/conf.juju/mapred-site.xml
+/etc/hadoop/conf.juju/hadoop-metrics2.properties"
+
+snapshot_config () {
+    juju-log "Capturing checksum of all configuration files"
+    for fconfig in $CONFIG_FILES
+    do
+        checksum_snapshot $fconfig
+    done
+}
+
+configure_ganglia () {
+    cp /etc/hadoop/conf.juju/hadoop-metrics2.properties                        \
+       /etc/hadoop/conf.juju/hadoop-metrics2.properties.orig
+    cat templates/hadoop-metrics2.properties |                                 \
+        sed -e "s/__MASTER__/`relation-get private-address`/g" >               \
+        /etc/hadoop/conf.juju/hadoop-metrics2.properties
+}
+
+purge_ganglia () {
+    cp /etc/hadoop/conf.juju/hadoop-metrics2.properties.orig                   \
+       /etc/hadoop/conf.juju/hadoop-metrics2.properties
+}
+
+configure_hadoop () {
+    # Copy distribution configuration and then specialize
+    if [ ! -d /etc/hadoop/conf.juju ]
+    then
+        cp -r /etc/hadoop/conf.empty /etc/hadoop/conf.juju
+        update-alternatives --install /etc/hadoop/conf hadoop-conf             \
+                                      /etc/hadoop/conf.juju 50
+        cp /dev/null /etc/hadoop/conf.juju/hdfs-site.xml
+        cp /dev/null /etc/hadoop/conf.juju/core-site.xml
+        cp /dev/null /etc/hadoop/conf.juju/mapred-site.xml
+        dotdee --setup /etc/hadoop/conf.juju/hdfs-site.xml
+        dotdee --setup /etc/hadoop/conf.juju/core-site.xml
+        dotdee --setup /etc/hadoop/conf.juju/mapred-site.xml
+    fi
+    # Configure HDFS
+    dir=`dotdee --dir /etc/hadoop/conf.juju/hdfs-site.xml`
+    config_basic $dir
+    # Purge existing configuration
+    rm -f $dir/1*-dfs.*
+    config_element "dfs.name.dir"                                             \
+                   "`config-get hadoop.dir.base`/cache/hadoop/dfs/name" >     \
+                   $dir/10-dfs.name.dir
+    config_element "dfs.namenode.handler.count"                               \
+                   "`config-get dfs.namenode.handler.count`" >                \
+                   $dir/11-dfs.namenode.handler.count
+    config_element "dfs.block.size"                                           \
+                   "`config-get dfs.block.size`" >                            \
+                   $dir/12-dfs.block.size
+    config_element "dfs.datanode.max.xcievers"                                \
+                   "`config-get dfs.datanode.max.xcievers`" >                 \
+                   $dir/13-dfs.datanode.max.xcievers
+    [ "`config-get hbase`" = "True" ] &&                                      \
+    config_element "dfs.support.append" "true" >                              \
+                   $dir/14-dfs.support.append || :
+    [ "`config-get webhdfs`" = "True" ] &&                                    \
+    config_element "dfs.webhdfs.enabled" "true" >                             \
+                   $dir/15-dfs.webhdfs.enabled || :
+    # TODO - secure this hadoop installation!
+    config_element "dfs.permissions" "false" >                                \
+                   $dir/16-dfs.permissions
+    dotdee --update /etc/hadoop/conf.juju/hdfs-site.xml || true
+    # Configure Map Reduce
+    dir=`dotdee --dir /etc/hadoop/conf.juju/mapred-site.xml`
+    config_basic $dir
+    rm -f $dir/20-*-*
+    counter=10
+    for element in $MAPRED_CONFIG
+    do
+        config_element "$element" "`config-get $element`" >                  \
+                       $dir/20-$counter-$element
+        counter=`expr $counter + 1`
+    done
+    dotdee --update /etc/hadoop/conf.juju/mapred-site.xml || true
+    # Configure Hadoop Core
+    dir=`dotdee --dir /etc/hadoop/conf.juju/core-site.xml`
+    config_basic $dir
+    rm -f $dir/1*-*
+    config_element "hadoop.tmp.dir"                                           \
+                   "`config-get hadoop.dir.base`/cache/\${user.name}" >       \
+                   $dir/10-hadoop.tmp.dir
+    config_element "io.file.buffer.size" "`config-get io.file.buffer.size`" > \
+                   $dir/11-io.file.buffer.size
+    dotdee --update /etc/hadoop/conf.juju/core-site.xml || true
+}
+
+configure_tmp_dir_perms() {
+    dir=`config-get hadoop.dir.base`
+    # Make sure the directory exists
+    mkdir -p $dir/cache/hadoop
+    # We don't want to do this recursively since we may be reinstalling
+    # in which case users have their own cache/<username> directories
+    # which shouldn't be stolen
+    chown root:hadoop $dir $dir/cache $dir/cache/hadoop
+    # Ensure group write on this directory or we can start namenode/datanode
+    chmod 775 $dir/cache/hadoop
+    chmod 1777 $dir/cache
+}
+
+configure_role_relation () {
+    dir=`dotdee --dir /etc/hadoop/conf.juju/core-site.xml`
+    juju-log "Configuring service unit relation $1..."
+    case $1 in
+    datanode|secondarynamenode|mapred-namenode)
+        namenode_address=`relation-get private-address`
+        config_element "fs.default.name" "hdfs://$namenode_address:8020" >     \
+                       $dir/50-fs.default.name
+    ;;
+    namenode)
+        private_address=`unit-get private-address`
+        config_element "fs.default.name" "hdfs://$private_address:8020" >      \
+                       $dir/50-fs.default.name
+    ;;
+    esac
+        dotdee --update /etc/hadoop/conf.juju/core-site.xml || true
+        dir=`dotdee --dir /etc/hadoop/conf.juju/hdfs-site.xml`
+    case $1 in
+    secondarynamenode)
+        namenode_address=`relation-get private-address`
+        config_element "dfs.http.address" "$namenode_address:50070" >          \
+                       $dir/50-dfs.http.address
+        private_address=`unit-get private-address`
+        config_element "dfs.secondary.http.address" "$private_address:50090" > \
+                       $dir/51-dfs.secondary.http.address
+    ;;
+    esac
+        dotdee --update /etc/hadoop/conf.juju/hdfs-site.xml || true
+        dir=`dotdee --dir /etc/hadoop/conf.juju/mapred-site.xml`
+    case $1 in
+    tasktracker)
+        jobtracker_address=`relation-get private-address`
+        config_element "mapred.job.tracker" "$jobtracker_address:8021" >       \
+                       $dir/50-mapred.job.tracker
+    ;;
+    jobtracker)
+        jobtracker_address=`unit-get private-address`
+        config_element "mapred.job.tracker" "$jobtracker_address:8021" >       \
+                       $dir/50-mapred.job.tracker
+    ;;
+    esac
+        dotdee --update /etc/hadoop/conf.juju/mapred-site.xml || true
+}
+
+install_packages () {
+    case $1 in
+    namenode|datanode|secondarynamenode|jobtracker|tasktracker)
+        juju-log "Installing extra packages for $1"
+        apt-get -y install hadoop.*$1$
+    ;;
+    *)
+        juju-log "Unsupported role $1..."
+    ;;
+    esac
+}
+
+format_namenode () {
+    juju-log "Formatting namenode filesystem"
+    sudo -u hdfs hdfs namenode -format
+}
+
+# TODO - Add these to charm-tools helpers.
+_status_ () {
+    /etc/init.d/$1 status | grep -q "start/running"                                \
+                        && return 0 || return 1
+}
+_restart_ () {
+    juju-log "Restarting $1"
+    _status_ $1 && sh -x /etc/init.d/$1 restart || /etc/init.d/$1 start
+}
+_start_ () {
+    juju-log "Starting $1"
+    _status_ $1 || /etc/init.d/$1 start
+}
+_stop_ () {
+    juju-log "Stopping $1"
+    _status_ $1 && /etc/init.d/$1 stop || :
+}
+
+# Hadoop Service Control Commands
+restart_hdfs () {
+    [ "$hdfs_role" != "unconfigured" ] &&                                      \
+    _restart_ hadoop-hdfs-$hdfs_role || :
+}
+stop_hdfs () {
+    [ "$hdfs_role" != "unconfigured" ] &&                                      \
+    _stop_ hadoop-hdfs-$hdfs_role || :
+}
+start_hdfs () {
+    [ "$hdfs_role" != "unconfigured" ] &&                                      \
+    _start_ hadoop-hdfs-$hdfs_role || :
+}
+restart_mapred () {
+    [ "$mapred_role" != "unconfigured" ] &&                                    \
+    _restart_ hadoop-0.20-mapreduce-$mapred_role || :
+}
+stop_mapred () {
+    [ "$mapred_role" != "unconfigured" ] &&                                    \
+    _stop_ hadoop-0.20-mapreduce-$mapred_role || :
+}
+start_mapred () {
+    [ "$mapred_role" != "unconfigured" ] &&                                    \
+    _start_ hadoop-0.20-mapreduce-$mapred_role || :
+}
+
+# Restart services only if configuration files
+# have actually changed
+conditional_restart () {
+    if file_changed /etc/hadoop/conf.juju/core-site.xml ||
+    file_changed /etc/hadoop/conf.juju/hadoop-metrics2.properties
+    then
+        # Core hadoop config has changed - normal restart
+        # of mapred and hdfs roles
+        restart_hdfs
+        restart_mapred
+        return 0
+    fi
+    if file_changed /etc/hadoop/conf.juju/hdfs-site.xml
+    then
+        # Just restart HDFS role
+        restart_hdfs
+    fi
+    if file_changed /etc/hadoop/conf.juju/mapred-site.xml
+    then
+        # Just restart mapreduce role
+        restart_mapred
+    fi
+}
+
+install_job () {
+    HADOOP_HOME=/usr/lib/hadoop
+    juju-log "installing terasort script"
+    cp scripts/terasort.sh $HADOOP_HOME
+    cp /usr/lib/hadoop-0.20-mapreduce/hadoop-examples-2.0.0-mr1-cdh4.2.0.jar   \
+       $HADOOP_HOME
+    chown hdfs.hdfs $HADOOP_HOME/terasort.sh
+    chmod 755 $HADOOP_HOME/terasort.sh
+}
+
+# Determines what type of node this is
+resolve_hdfs_role () {
+    role="unconfigured"
+    [ -f /etc/init.d/hadoop-hdfs-namenode ] &&                                 \
+    role="namenode" || :
+    [ -f /etc/init.d/hadoop-hdfs-secondarynamenode ] &&                        \
+    role="secondarynamenode" || :
+    [ -f /etc/init.d/hadoop-hdfs-datanode ] &&                                 \
+    role="datanode" || :
+    echo "$role"
+}
+resolve_mapred_role () {
+    role="unconfigured"
+    [ -d /usr/share/doc/hadoop-0.20-mapreduce-jobtracker ] &&                  \
+    role="jobtracker" || :
+    [ -d /usr/share/doc/hadoop-0.20-mapreduce-tasktracker ] &&                 \
+    role="tasktracker" || :
+    echo "$role"
+}
+
+hdfs_role=`resolve_hdfs_role`
+mapred_role=`resolve_mapred_role`
+
+COMMAND=`basename $0`
+
+case $COMMAND in
+    install)
+        configure_hosts
+        configure_sources
+        install_base_packages
+        install_optional_packages
+        configure_hadoop
+        configure_tmp_dir_perms
+        ;;
+    jobtracker-relation-joined)
+        case $mapred_role in
+            unconfigured)
+                juju-log "Configuring this unit as a jobtracker"
+                mapred_role="jobtracker"
+                configure_role_relation $mapred_role
+                install_packages $mapred_role
+                sleep 10
+                restart_mapred
+                open_ports
+                install_job
+                # Some hadoop processes take a bit of time to start
+                # we need to let them get to a point where they are
+                # ready to accept connections
+                sleep 5 && relation-set ready="true"
+                ;;
+            jobtracker)
+                juju-log "Already configured as $mapred_role"
+                # Unit should only ever assume this role once so no
+                # further action is required - this prevents adding
+                # an additional unit to the namenode master breaking
+                # things.
+                relation-set ready="true"
+                ;;
+            *)
+                juju-log "Already configured as another role: $mapred_role"
+                exit 1
+                ;;
+        esac
+        ;;
+    tasktracker-relation-changed)
+        case $mapred_role in
+            unconfigured)
+                while [ `relation-get ready` == "" ]
+                do
+                    sleep 5
+                done
+                juju-log "Configuring this unit as a tasktracker"
+                mapred_role="tasktracker"
+                configure_role_relation $mapred_role
+                install_packages $mapred_role
+                sleep 10
+                restart_mapred
+                open_ports
+                ;;
+            tasktracker)
+                juju-log "Already configured as $mapred_role"
+                # Unit should only ever assume this role once so no
+                # further action is required - this prevents adding
+                # an additional unit to the namenode master breaking
+                # things.
+                ;;
+            *)
+                juju-log "Already configured as another role: $mapred_role"
+                exit 1
+                ;;
+        esac
+        ;;
+    mapred-namenode-relation-changed)
+        # A bit different to the others as this relation does not
+        # give the unit a role - it just configures the DFS root
+        while [ `relation-get ready` == "" ]
+        do
+            sleep 5
+        done
+        configure_role_relation mapred-namenode
+        restart_hdfs
+        ;;
+    namenode-relation-joined)
+        case $hdfs_role in
+            unconfigured)
+                juju-log "Configuring this unit as a namenode"
+                hdfs_role="namenode"
+                configure_role_relation $hdfs_role
+                install_packages $hdfs_role
+                stop_hdfs
+                format_namenode
+                restart_hdfs
+                open_ports
+                # Some hadoop processes take a bit of time to start
+                # we need to let them get to a point where they are
+                # ready to accept connections
+                sleep 5 && relation-set ready="true"
+                ;;
+            namenode)
+                juju-log "Already configured as namenode"
+                # Unit should only ever assume this role once so no
+                # further action is required - this prevents adding
+                # an additional unit to the namenode master breaking
+                # things.
+                relation-set ready="true"
+                ;;
+            *)
+                juju-log "Already configured as another role: $hdfs_role"
+                exit 1
+                ;;
+        esac
+        ;;
+    secondarynamenode-relation-changed)
+        case $hdfs_role in
+            unconfigured)
+                while [ `relation-get ready` == "" ]
+                do
+                    sleep 5
+                done
+                juju-log "Configuring this unit as a secondarynamenode"
+                hdfs_role="secondarynamenode"
+                configure_role_relation $hdfs_role
+                install_packages $hdfs_role
+                open_ports
+                ;;
+            secondarynamenode)
+                juju-log "Already configured as secondarynamenode"
+                # Unit should only ever assume this role once so no
+                # further action is required - this prevents adding
+                # an additional unit to the namenode master breaking
+                # things.
+                ;;
+            *)
+                juju-log "Already configured as another role: $hdfs_role"
+                exit 1
+                ;;
+        esac
+        ;;
+    datanode-relation-changed)
+        case $hdfs_role in
+            unconfigured)
+                while [ `relation-get ready` == "" ]
+                do
+                    sleep 5
+                done
+                juju-log "Configuring this unit as a datanode"
+                hdfs_role="datanode"
+                configure_role_relation $hdfs_role
+                install_packages $hdfs_role
+                open_ports
+                ;;
+            datanode)
+                juju-log "Already configured as datanode"
+                # Unit should only ever assume this role once so no
+                # further action is required - this prevents adding
+                # an additional unit to the namenode master breaking
+                # things.
+                ;;
+            *)
+                juju-log "Already configured as another role: $hdfs_role"
+                exit 1
+                ;;
+        esac
+        ;;
+    ganglia-relation-changed)
+        # Call generic ganglia install and configure script
+        # TODO supercede when subordinates land.
+        [ -x hooks/ganglia-common ] && hooks/ganglia-common || :
+        configure_ganglia
+        conditional_restart # only restart if pertinent config has changed!
+        ;;
+    ganglia-relation-departed|ganglia-relation-broken)
+        purge_ganglia
+        conditional_restart # only restart if pertinent config has changed!
+        ;;
+    upgrade-charm|config-changed)
+        install_optional_packages
+        configure_hadoop
+        configure_tmp_dir_perms
+        conditional_restart # only restart if pertinent config has changed!
+        open_ports
+        ;;
+    *)
+        juju-log "Command not recognised"
+        ;;
+esac
+
+# Finally always capture a snapshot of all config files
+snapshot_config

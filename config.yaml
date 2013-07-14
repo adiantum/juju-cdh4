@@ -1,0 +1,154 @@
+options:
+  source:
+    type: string
+    default: stable
+    description: |
+      Location and packages to install hadoop:
+      .
+       * dev:     Install using the hadoop packages from
+                  ppa:hadoop-ubuntu/dev.
+       * testing: Install using the hadoop packages from
+                  ppa:hadoop-ubuntu/testing.
+       * stable:  Install using the hadoop packages from
+                  ppa:hadoop-ubuntu/stable.
+      .
+      The packages provided in the hadoop-ubuntu team PPA's are based
+      directly on upstream hadoop releases but are not fully built from
+      source.
+  hbase:
+    type: boolean
+    default: False
+    description: |
+      Setting this configuration parameter to 'True' configures HDFS for
+      use with HBase including turning on 'append' mode which is not
+      desirable in all deployment scenarios.
+  webhdfs:
+    type: boolean
+    default: False
+    description: |
+      Hadoop includes a RESTful API over HTTP to HDFS.  Setting this flag
+      to True enables this part of the HDFS service.
+  pig:
+    type: boolean
+    default: False
+    description: |
+      To install Apache Pig on all service units alongside Hadoop set this
+      configuration to 'True'.
+      .
+      Apache Pig is a platform for analyzing large data sets that consists
+      of a high-level language for expressing data analysis programs, coupled
+      with infrastructure for evaluating these programs. The salient property
+      of Pig programs is that their structure is amenable to substantial
+      parallelization, which in turns enables them to handle very large data
+      sets.
+  heap:
+    type: int
+    default: 1024
+    description: |
+      The maximum heap size in MB to allocate for daemons processes within the
+      service units managed by this charm.
+      .
+      The recommended configurations vary based on role and the amount of
+      raw disk storage available in the hadoop cluster:
+      .
+       * NameNode: 1GB of heap for every 100TB of raw data stored.
+       * SecondaryNameNode: Must be paired with the NameNode.
+       * JobTracker: 2GB.
+       * DataNode: 1GB.
+       * TaskTracker: 1GB.
+      .
+      The above recommendations are taken from HBase: The Definitive Guide by
+      Lars George.
+      .
+      Obviously you need to ensure that the servers supporting each service unit
+      have sufficient memory to accomodate this setting - it should be no more
+      than 75% of the total memory in the system excluding swap.
+      .
+      If you are also mixing MapReduce and DFS roles on the same units you need to
+      take this into account as well (see README for more details).
+# Expert options See http://wiki.apache.org/hadoop/FAQ#How_well_does_Hadoop_scale.3F
+# for more details
+  dfs.namenode.handler.count:
+    type: int
+    default: 10
+    description: |
+      The number of server threads for the namenode.  Increase this in larger
+      deployments to ensure the namenode can cope with the number of datanodes
+      that it has to deal with.
+  dfs.block.size:
+    type: int
+    default: 67108864
+    description: |
+      The default block size for new files (default to 64MB).  Increase this in
+      larger deployments for better large data set performance.
+  io.file.buffer.size:
+    type: int
+    default: 4096
+    description: |
+      The size of buffer for use in sequence files. The size of this buffer should
+      probably be a multiple of hardware page size (4096 on Intel x86), and it
+      determines how much data is buffered during read and write operations.
+  dfs.datanode.max.xcievers:
+    type: int
+    default: 4096
+    description: |
+      The number of files that an datanode will serve at any one time.
+      .
+      An HDFS datanode has an upper bound on the number of files that it
+      will serve at any one time. This defaults to 256 (which is low) in hadoop
+      1.x - however this charm increases that to 4096.
+  mapred.reduce.parallel.copies:
+    type: int
+    default: 5
+    description: |
+      The default number of parallel transfers run by reduce during the
+      copy(shuffle) phase.
+  mapred.child.java.opts:
+    type: string
+    default: -Xmx200m
+    description: |
+      Java opts for the task tracker child processes. The following symbol,
+      if present, will be interpolated: @taskid@ is replaced by current TaskID.
+      Any other occurrences of '@' will go unchanged. For example, to enable
+      verbose gc logging to a file named for the taskid in /tmp and to set
+      the heap maximum to be a gigabyte, pass a 'value' of:
+      .
+        -Xmx1024m -verbose:gc -Xloggc:/tmp/@taskid@.gc
+      .
+      The configuration variable mapred.child.ulimit can be used to control
+      the maximum virtual memory of the child processes.
+  io.sort.factor:
+    type: int
+    default: 10
+    description: |
+      The number of streams to merge at once while sorting files. This
+      determines the number of open file handles.
+  io.sort.mb:
+    type: int
+    default: 100
+    description: |
+      The total amount of buffer memory to use while sorting files, in
+      megabytes. By default, gives each merge stream 1MB, which should minimize
+      seeks.
+  mapred.job.tracker.handler.count:
+    type: int
+    default: 10
+    description: |
+      The number of server threads for the JobTracker. This should be roughly
+      4% of the number of tasktracker nodes.
+  tasktracker.http.threads:
+    type: int
+    default: 40
+    description: |
+      The number of worker threads that for the http server. This is used for
+      map output fetching.
+  hadoop.dir.base:
+    type: string
+    default: /var/lib/hadoop
+    description: |
+      The directory under which all other hadoop data is stored.  Use this
+      to take advantage of extra storage that might be avaliable.
+      .
+      You can change this in a running deployment but all existing data in
+      HDFS will be inaccessible; you can of course switch it back if you
+      do this by mistake.
