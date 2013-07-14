@@ -6,7 +6,6 @@ Juju charm for Cloudera hadoop distribution CDH4 based on https://jujucharms.com
 Separate HDFS and MapReduce deployment:
 
 ```juju deploy local:cdh4 hdfs-namenode
-
 juju deploy local:cdh4 mapred-jobtracker
 juju deploy local:cdh4 hadoop-slavecluster
 juju add-relation hdfs-namenode:namenode hadoop-slavecluster:datanode
